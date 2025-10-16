@@ -1,0 +1,246 @@
+from typing import Optional, Sequence, Any, Union
+import numpy as np
+import pandas as pd
+from pyexpat import features
+from scipy.signal import welch, stft
+from scipy.stats import skew, kurtosis
+import pywt
+
+def stat_time_summary(sequence: np.ndarray) -> dict:
+    """计算时域统计量，返回中文特征名字典（对 NaN/空序列作健壮处理）"""
+    arr = np.asarray(sequence).ravel()
+    # 去除 NaN
+    arr = arr[~np.isnan(arr)]
+    if arr.size == 0:
+        return {}
+    mean_v = float(np.mean(arr))
+    std_v = float(np.std(arr))
+    var_v = float(np.var(arr))
+    rms_v = float(np.sqrt(np.mean(arr ** 2)))
+    mean_abs_v = float(np.mean(np.abs(arr)))
+    sqrt_mean_v = float(np.mean(np.sqrt(np.abs(arr))))
+    peak_v = float(np.max(np.abs(arr)))
+    ptp_v = float(np.ptp(arr))
+    eps = 1e-12
+
+    return {
+        "均值": mean_v,
+        "标准差": std_v,
+        "方差": var_v,
+        "均方根": rms_v,
+        "峰值": peak_v,
+        "峰峰值": ptp_v,
+        "平均绝对值": mean_abs_v,
+        "波形指标": rms_v / (mean_abs_v + eps),
+        "峭度指标": peak_v / (rms_v + eps),
+        "脉冲指标": peak_v / (mean_abs_v + eps),
+        "裕度指标": peak_v / (sqrt_mean_v ** 2 + eps),
+        "间隙指标": peak_v / (sqrt_mean_v + eps),
+        "峭度": float(kurtosis(arr, fisher=False)) if arr.size > 0 else 0.0,
+        "偏度": float(skew(arr)) if arr.size > 0 else 0.0,
+    }
+
+def stat_frequency_summary(sequence: np.ndarray, sample_hz: int, rotation_hz: float) -> dict:
+    """计算频域统计量（Welch）并按转速归一化频率（对 NaN/空序列作健壮处理）"""
+    arr = np.asarray(sequence).ravel()
+    arr = arr[~np.isnan(arr)]
+    if arr.size == 0:
+        return {}
+
+    nperseg = min(2048, arr.size) if arr.size > 1 else 1
+    try:
+        freqs, psd = welch(arr, fs=sample_hz, nperseg=nperseg)
+    except Exception:
+        # 在极端情况下退回到简单 FFT 能量分布（保证不报错）
+        freqs = np.fft.rfftfreq(arr.size, d=1.0 / sample_hz)
+        fft_vals = np.abs(np.fft.rfft(arr)) ** 2
+        psd = fft_vals
+
+    psd_sum = float(np.sum(psd))
+    psd_norm = psd / (psd_sum + 1e-12) if psd_sum > 0 else psd
+    freqs_norm = freqs / (rotation_hz + 1e-12)
+
+    centroid = float(np.sum(freqs_norm * psd_norm))
+    bandwidth = float(np.sqrt(np.sum(((freqs_norm - centroid) ** 2) * psd_norm)))
+    spec_skew = float(skew(psd_norm)) if psd_norm.size > 0 else 0.0
+    spec_kurt = float(kurtosis(psd_norm, fisher=False)) if psd_norm.size > 0 else 0.0
+    spec_entropy = float(-np.sum(psd_norm * np.log(psd_norm + 1e-12)))
+
+    res = {
+        "谱质心": centroid,
+        "谱带宽": bandwidth,
+        "谱偏度": spec_skew,
+        "谱峭度": spec_kurt,
+        "谱熵": spec_entropy,
+    }
+
+    # 预定义带通区间（归一化频率）
+    band_defs = [(0.8, 1.2), (1.8, 2.2), (2.8, 3.2), (4.5, 5.5)]
+    for bi, (lo, hi) in enumerate(band_defs, start=1):
+        mask = (freqs_norm >= lo) & (freqs_norm <= hi)
+        res[f"带通能量_{bi}"] = float(np.sum(psd_norm[mask])) if mask.any() else 0.0
+
+    return res
+
+def stat_timefreq_summary(sequence: np.ndarray, sample_hz: int, rotation_hz: float) -> dict:
+    """计算时-频统计（STFT 熵与平均频率）以及小波能量占比（健壮处理异常）"""
+    arr = np.asarray(sequence).ravel()
+    arr = arr[~np.isnan(arr)]
+    if arr.size == 0:
+        return {}
+
+    # STFT 部分
+    nperseg = min(1024, arr.size) if arr.size > 1 else 1
+    tf_entropy = 0.0
+    tf_meanfreq = 0.0
+    try:
+        f_stft, t_stft, Z = stft(arr, fs=sample_hz, nperseg=nperseg, noverlap=nperseg // 2)
+        power = np.abs(Z) ** 2
+        p_sum = float(np.sum(power))
+        power_norm = power / (p_sum + 1e-12) if p_sum > 0 else power
+        tf_entropy = float(-np.sum(power_norm * np.log(power_norm + 1e-12)))
+        mean_power_across_time = np.mean(power_norm, axis=1)
+        f_norm = f_stft / (rotation_hz + 1e-12)
+        tf_meanfreq = float(np.sum(mean_power_across_time * f_norm))
+    except Exception:
+        tf_entropy = 0.0
+        tf_meanfreq = 0.0
+
+    feats = {
+        "时频熵": tf_entropy,
+        "时频均值频率": tf_meanfreq,
+    }
+
+    # 小波分解能量比
+    try:
+        coeffs = pywt.wavedec(arr, 'db4', level=4)
+        energies = np.array([np.sum(c ** 2) for c in coeffs], dtype=float)
+        total_e = float(np.sum(energies))
+        ratios = energies / (total_e + 1e-12) if total_e > 0 else np.zeros_like(energies)
+        for ii, r in enumerate(ratios):
+            feats[f"小波能量_{ii}"] = float(r)
+    except Exception:
+        # 若小波分解失败，填 0
+        for ii in range(5):
+            feats[f"小波能量_{ii}"] = 0.0
+
+    return feats
+
+def extract_eeg_features(
+    signals: Union[np.ndarray, Sequence[np.ndarray]],
+    sample_hz: int,
+    rotation_hz: float = 1.0,
+    channel_names: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """
+    提取批量 EEG 信号的特征并返回 pandas.DataFrame。
+    - signals: 支持形状 (n_epochs, n_channels, n_samples)，(n_channels, n_samples)，(n_samples, n_channels)，(n_samples,), 也支持列表/序列形式。
+    - sample_hz: 采样率（Hz）
+    - rotation_hz: 用于归一化频率的旋转/参考频率（若无可设为 1.0）
+    - channel_names: 可选的通道名称序列，长度应等于 n_channels；若为 None，则自动命名为 Ch1, Ch2, ...
+    返回:
+      pandas.DataFrame，行对应每个 epoch（若输入不是批量则为单行），列为 "{channel_name}_{feature_name}"。
+    """
+    # 将输入标准化成 numpy 数组
+    sig = np.asarray(signals)
+
+    # 判定输入维度并转换为 (n_epochs, n_channels, n_samples)
+    if sig.ndim == 1:
+        # 单通道单段 -> 1 epoch, 1 channel
+        sig = sig.reshape(1, 1, -1)
+    elif sig.ndim == 2:
+        # 可能为 (n_channels, n_samples) 或 (n_samples, n_channels)
+        n0, n1 = sig.shape
+        # 经验规则：若 n0 < n1，通常 n0 是通道数（但不绝对）
+        # 优先假设第一维为通道数（n_channels, n_samples）
+        # 但为了更稳健，若 n0 > n1（即样本比通道多），我们也尝试识别
+        # 这里采用简单判断：若 n0 <= 128（假设通道数），则认为 (n_channels, n_samples)
+        if n0 <= 256 and n1 > 1:
+            sig = sig.reshape(1, n0, n1)
+        else:
+            # 否则假设 (n_samples, n_channels)
+            sig = sig.T.reshape(1, n1, n0)
+    elif sig.ndim == 3:
+        # 可能为 (n_epochs, n_channels, n_samples) 或 (n_epochs, n_samples, n_channels)
+        n0, n1, n2 = sig.shape
+        # 判定中间维是否可能为样本
+        if n1 > n2:
+            # 假设 (n_epochs, n_samples, n_channels) -> 转置为 (n_epochs, n_channels, n_samples)
+            sig = sig.transpose(0, 2, 1)
+        # else 假设已经是 (n_epochs, n_channels, n_samples)
+    else:
+        raise ValueError("signals 维度不支持（仅支持 1D/2D/3D numpy 数组或等价序列）")
+
+    n_epochs, n_channels, n_samples = sig.shape
+
+    # 若提供 channel_names，校验长度，否则自动生成
+    if channel_names is not None:
+        if len(channel_names) != n_channels:
+            raise ValueError(f"channel_names 长度 ({len(channel_names)}) 与通道数 ({n_channels}) 不匹配。")
+        ch_names = list(channel_names)
+    else:
+        ch_names = [f"Ch{i+1}" for i in range(n_channels)]
+
+    rows = []
+    col_order = []  # 用于保持列顺序
+
+    # 先用第一个非空通道计算特征名模板（保证所有行列一致）
+    template_feats = None
+    for e in range(n_epochs):
+        row_dict = {}
+        for ch_idx in range(n_channels):
+            seq = sig[e, ch_idx, :]
+            # 若序列全 NaN 或长度为0，则使用空特征字典（会补 0）
+            t_feats = stat_time_summary(seq)
+            f_feats = stat_frequency_summary(seq, sample_hz=sample_hz, rotation_hz=rotation_hz)
+            tf_feats = stat_timefreq_summary(seq, sample_hz=sample_hz, rotation_hz=rotation_hz)
+
+            # 合并三部分特征（保持顺序）
+            merged = {}
+            merged.update(t_feats)
+            merged.update(f_feats)
+            merged.update(tf_feats)
+
+            # 若 template_feats 为空，记录当前通道特征名顺序（后续统一列名）
+            if template_feats is None:
+                template_feats = list(merged.keys())
+
+            # 若当前 merged 缺少某些 template 特征，则补 0.0；反之若有新特征也并入 template（可能发生在首个非空通道后）
+            # 为保证列结构一致，我们在第一次 epoch/ch loop 后不再改变 template_feats（所以此处尽量填充完整）
+            # 将每个特征与通道名拼接成列名
+            for feat_name in merged:
+                col_name = f"{ch_names[ch_idx]}_{feat_name}"
+                row_dict[col_name] = merged[feat_name]
+
+        rows.append(row_dict)
+
+    # 统一列名：收集所有列名，按通道顺序与特征顺序排列（若某些行缺失列，填 NaN -> 再填 0）
+    # 构造期望列顺序：对每个通道，按 template_feats 顺序创建列名
+    if template_feats is None:
+        # 所有数据均空 -> 返回空 DataFrame
+        return pd.DataFrame()
+
+    expected_cols = []
+    for ch in ch_names:
+        for feat in template_feats:
+            expected_cols.append(f"{ch}_{feat}")
+
+    df = pd.DataFrame(rows, columns=expected_cols)
+    # 将 NaN 填为 0.0（可根据需要改为其他策略）
+    df = df.fillna(0.0)
+
+    return df
+
+# -------------------------
+# 使用示例：
+# -------------------------
+if __name__ == "__main__":
+    from config import cfg
+    from utils.loading import loaddata_singal,loaddata_BCICIV2B,loaddata_BCICIV2A
+    cfgs = cfg().get_args()
+    dataset = loaddata_singal(crt=False)
+    data,labels = dataset
+    feats = extract_eeg_features(signals=data,sample_hz=250)
+    feats['labels'] = labels
+    print(feats.shape)
+    feats.to_csv(cfgs.feats)
